@@ -7,6 +7,7 @@ import Job from "../../../../models/Job"
 import User from "../../../../models/User"
 import Notification from "../../../../models/Notification"
 
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET
 
