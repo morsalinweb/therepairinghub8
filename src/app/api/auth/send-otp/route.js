@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { connectToDatabase } from "../../../../lib/db"
+import  connectToDatabase  from "../../../../lib/db"
 import { generateOTP, sendEmail } from "../../../../lib/email"
 
 export const dynamic = "force-dynamic"
