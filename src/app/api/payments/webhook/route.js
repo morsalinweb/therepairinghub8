@@ -265,6 +265,7 @@ async function completeJob(jobId) {
       await User.findByIdAndUpdate(job.hiredProvider, {
         $inc: {
           balance: providerAmount,
+          availableBalance: providerAmount,
           totalEarnings: providerAmount,
         },
       })
