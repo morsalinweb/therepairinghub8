@@ -1,137 +1,314 @@
-// Update the websocket client to handle more event types
-import { eventEmitter } from "./websocket-utils"
+"use client"
 
-// Function to initialize WebSocket connection
-export function initializeWebSocket(token) {
-  if (!token) {
-    console.error("No auth token provided for WebSocket connection")
-    return null
+import { useEffect, useRef, useCallback, useState } from "react"
+import { useAuth } from "@/contexts/auth-context"
+import { messageAPI } from "@/lib/api"
+
+// Event emitter for real-time updates
+class EventEmitter {
+  constructor() {
+    this.events = {}
   }
 
-  // Check if we're in a browser environment
-  if (typeof window === "undefined") {
-    return null
+  on(event, callback) {
+    if (!this.events[event]) {
+      this.events[event] = []
+    }
+    this.events[event].push(callback)
+
+    // Return unsubscribe function
+    return () => {
+      this.events[event] = this.events[event].filter((cb) => cb !== callback)
+    }
   }
 
-  try {
-    // Create WebSocket connection
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
-    const wsUrl = `${protocol}//${window.location.host}/ws?token=${token}`
+  emit(event, data) {
+    if (this.events[event]) {
+      this.events[event].forEach((callback) => {
+        try {
+          callback(data)
+        } catch (error) {
+          console.error("Error in event callback:", error)
+        }
+      })
+    }
+  }
+}
 
-    console.log("Initializing WebSocket connection to:", wsUrl)
+export const eventEmitter = new EventEmitter()
 
-    const socket = new WebSocket(wsUrl)
+// WebSocket connection manager
+class WebSocketManager {
+  constructor() {
+    this.ws = null
+    this.reconnectAttempts = 0
+    this.maxReconnectAttempts = 5
+    this.reconnectDelay = 1000
+    this.isConnecting = false
+    this.messageQueue = []
+    this.subscriptions = new Set()
+  }
 
-    // Connection opened
-    socket.addEventListener("open", (event) => {
-      console.log("WebSocket connection established")
+  connect(userId) {
+    if (this.isConnecting || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
+      return
+    }
 
-      // Store socket in window for global access
-      window.socket = socket
+    this.isConnecting = true
+    const wsUrl =
+      process.env.NODE_ENV === "production"
+        ? `wss://${window.location.host}/ws`
+        : `ws://localhost:${process.env.PORT || 3000}/ws`
 
-      // Emit connection event
-      eventEmitter.emit("ws_connected")
-    })
+    console.log("🔌 Attempting WebSocket connection to:", wsUrl)
 
-    // Listen for messages
-    socket.addEventListener("message", (event) => {
+    try {
+      this.ws = new WebSocket(wsUrl)
+
+      this.ws.onopen = () => {
+        console.log("✅ WebSocket connected")
+        this.isConnecting = false
+        this.reconnectAttempts = 0
+
+        // Send authentication
+        if (userId) {
+          this.send({ type: "auth", userId })
+        }
+
+        // Send queued messages
+        while (this.messageQueue.length > 0) {
+          const message = this.messageQueue.shift()
+          this.send(message)
+        }
+
+        // Re-subscribe to all subscriptions
+        this.subscriptions.forEach((subscription) => {
+          this.send(subscription)
+        })
+
+        eventEmitter.emit("websocket_connected")
+      }
+
+      this.ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          console.log("📨 WebSocket message received:", data)
+
+          // Emit the event to all listeners
+          eventEmitter.emit(data.type, data)
+
+          // Handle specific message types
+          switch (data.type) {
+            case "job_updated":
+              eventEmitter.emit("job_update", data)
+              break
+            case "new_message":
+              eventEmitter.emit("new_message", data.message)
+              break
+            case "payment_updated":
+              eventEmitter.emit("payment_update", data)
+              break
+            case "escrow_released":
+              eventEmitter.emit("escrow_released", data)
+              break
+            case "transaction_updated":
+              eventEmitter.emit("transaction_update", data)
+              break
+          }
+        } catch (error) {
+          console.error("Error parsing WebSocket message:", error)
+        }
+      }
+
+      this.ws.onclose = (event) => {
+        console.log("🔌 WebSocket disconnected:", event.code, event.reason)
+        this.isConnecting = false
+        this.ws = null
+
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++
+          const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
+          console.log(`🔄 Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`)
+          setTimeout(() => this.connect(userId), delay)
+        } else {
+          console.error("❌ Max reconnection attempts reached")
+          eventEmitter.emit("websocket_disconnected")
+        }
+      }
+
+      this.ws.onerror = (error) => {
+        console.error("❌ WebSocket error:", error)
+        this.isConnecting = false
+      }
+    } catch (error) {
+      console.error("❌ Failed to create WebSocket connection:", error)
+      this.isConnecting = false
+    }
+  }
+
+  send(message) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message))
+    } else {
+      // Queue message for when connection is established
+      this.messageQueue.push(message)
+    }
+  }
+
+  subscribe(subscription) {
+    this.subscriptions.add(subscription)
+    this.send(subscription)
+  }
+
+  unsubscribe(subscription) {
+    this.subscriptions.delete(subscription)
+    this.send({ ...subscription, action: "unsubscribe" })
+  }
+
+  disconnect() {
+    if (this.ws) {
+      this.ws.close()
+      this.ws = null
+    }
+    this.subscriptions.clear()
+    this.messageQueue = []
+    this.reconnectAttempts = 0
+    this.isConnecting = false
+  }
+}
+
+const wsManager = new WebSocketManager()
+
+export const useRealTimeUpdates = () => {
+  const { user } = useAuth()
+  const [isConnected, setIsConnected] = useState(false)
+  const messagePollingRef = useRef(null)
+  const currentConversationRef = useRef(null)
+
+  // Connect to WebSocket when user is available
+  useEffect(() => {
+    if (user?._id) {
+      wsManager.connect(user._id)
+
+      const handleConnected = () => setIsConnected(true)
+      const handleDisconnected = () => setIsConnected(false)
+
+      const unsubscribeConnected = eventEmitter.on("websocket_connected", handleConnected)
+      const unsubscribeDisconnected = eventEmitter.on("websocket_disconnected", handleDisconnected)
+
+      return () => {
+        unsubscribeConnected()
+        unsubscribeDisconnected()
+      }
+    }
+  }, [user?._id])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (messagePollingRef.current) {
+        clearInterval(messagePollingRef.current)
+      }
+    }
+  }, [])
+
+  const subscribeToJobUpdates = useCallback((jobId, callback) => {
+    console.log("🔔 Subscribing to job updates for:", jobId)
+
+    const subscription = { type: "subscribe_job", jobId }
+    wsManager.subscribe(subscription)
+
+    const unsubscribe = eventEmitter.on("job_update", callback)
+
+    return () => {
+      console.log("🔕 Unsubscribing from job updates for:", jobId)
+      wsManager.unsubscribe(subscription)
+      unsubscribe()
+    }
+  }, [])
+
+  const subscribeToPaymentUpdates = useCallback((userId, callback) => {
+    console.log("🔔 Subscribing to payment updates for user:", userId)
+
+    const subscription = { type: "subscribe_payments", userId }
+    wsManager.subscribe(subscription)
+
+    const unsubscribePayment = eventEmitter.on("payment_update", callback)
+    const unsubscribeEscrow = eventEmitter.on("escrow_released", callback)
+    const unsubscribeTransaction = eventEmitter.on("transaction_update", callback)
+
+    return () => {
+      console.log("🔕 Unsubscribing from payment updates for user:", userId)
+      wsManager.unsubscribe(subscription)
+      unsubscribePayment()
+      unsubscribeEscrow()
+      unsubscribeTransaction()
+    }
+  }, [])
+
+  const sendMessage = useCallback(async (jobId, recipientId, content) => {
+    try {
+      const { success, message } = await messageAPI.sendMessage({
+        jobId,
+        recipientId,
+        content,
+      })
+
+      if (success) {
+        // Emit the message via WebSocket for real-time updates
+        wsManager.send({
+          type: "new_message",
+          message,
+        })
+        return true
+      }
+      return false
+    } catch (error) {
+      console.error("Error sending message:", error)
+      return false
+    }
+  }, [])
+
+  const startMessagePolling = useCallback((jobId, recipientId) => {
+    // Stop any existing polling
+    if (messagePollingRef.current) {
+      clearInterval(messagePollingRef.current)
+    }
+
+    currentConversationRef.current = { jobId, recipientId }
+
+    // Start polling every 5 seconds as backup to WebSocket
+    messagePollingRef.current = setInterval(async () => {
       try {
-        const data = JSON.parse(event.data)
-        console.log("WebSocket message received:", data)
-
-        // Handle different event types
-        switch (data.type) {
-          case "job_updated":
-            eventEmitter.emit("job_updated", data.payload)
-            break
-          case "message":
-            eventEmitter.emit("new_message", data.payload)
-            break
-          case "notification":
-            eventEmitter.emit("notification", data.payload)
-            break
-          case "payment_updated":
-            eventEmitter.emit("payment_updated", data.payload)
-            break
-          case "transaction_updated":
-            eventEmitter.emit("transaction_updated", data.payload)
-            break
-          case "escrow_released":
-            eventEmitter.emit("escrow_released", data.payload)
-            break
-          default:
-            console.log("Unknown WebSocket message type:", data.type)
+        const { success, messages } = await messageAPI.getMessages(jobId, recipientId)
+        if (success && messages && messages.length > 0) {
+          // Emit the latest message if it's new
+          const latestMessage = messages[messages.length - 1]
+          eventEmitter.emit("new_message", latestMessage)
         }
       } catch (error) {
-        console.error("Error parsing WebSocket message:", error)
+        console.error("Error polling messages:", error)
       }
-    })
+    }, 5000)
+  }, [])
 
-    // Connection closed
-    socket.addEventListener("close", (event) => {
-      console.log("WebSocket connection closed:", event.code, event.reason)
+  const stopMessagePolling = useCallback(() => {
+    if (messagePollingRef.current) {
+      clearInterval(messagePollingRef.current)
+      messagePollingRef.current = null
+    }
+    currentConversationRef.current = null
+  }, [])
 
-      // Remove socket from window
-      delete window.socket
-
-      // Emit disconnection event
-      eventEmitter.emit("ws_disconnected")
-
-      // Attempt to reconnect after delay if closure wasn't intentional
-      if (event.code !== 1000) {
-        console.log("Attempting to reconnect in 5 seconds...")
-        setTimeout(() => {
-          initializeWebSocket(token)
-        }, 5000)
-      }
-    })
-
-    // Connection error
-    socket.addEventListener("error", (error) => {
-      console.error("WebSocket error:", error)
-
-      // Emit error event
-      eventEmitter.emit("ws_error", error)
-    })
-
-    return socket
-  } catch (error) {
-    console.error("Failed to initialize WebSocket:", error)
-    return null
+  return {
+    isConnected,
+    subscribeToJobUpdates,
+    subscribeToPaymentUpdates,
+    sendMessage,
+    startMessagePolling,
+    stopMessagePolling,
   }
 }
 
-// Function to send a message through WebSocket
-export function sendWebSocketMessage(type, payload) {
-  if (typeof window === "undefined" || !window.socket) {
-    console.error("WebSocket not initialized")
-    return false
-  }
+export default useRealTimeUpdates
 
-  try {
-    const message = JSON.stringify({
-      type,
-      payload,
-    })
-
-    window.socket.send(message)
-    return true
-  } catch (error) {
-    console.error("Error sending WebSocket message:", error)
-    return false
-  }
-}
-
-// Function to close WebSocket connection
-export function closeWebSocket() {
-  if (typeof window === "undefined" || !window.socket) {
-    return
-  }
-
-  try {
-    window.socket.close(1000, "User logged out")
-    delete window.socket
-  } catch (error) {
-    console.error("Error closing WebSocket:", error)
-  }
-}
