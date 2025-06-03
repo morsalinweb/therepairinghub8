@@ -94,19 +94,37 @@ export default function JobDetails({ params }) {
       const unsubscribe = subscribeToJobUpdates(job._id, (data) => {
         console.log("Job update received in component:", data)
         if (data.action === "updated") {
+          // Force refresh job details to ensure we have the latest data
+          fetchJobDetails()
           dispatch(updateJob(data.job))
+
+          // Show toast notification for important updates
+          if (data.job.status !== job.status) {
+            toast({
+              title: "Job Status Updated",
+              description: `Job status changed to ${data.job.status}`,
+            })
+          }
         } else if (data.action === "hired" && data.providerId === user?._id) {
           toast({
             title: "You've been hired!",
             description: `You have been hired for the job: ${data.job.title}`,
           })
+          fetchJobDetails()
+          dispatch(updateJob(data.job))
+        } else if (data.action === "payment_updated") {
+          toast({
+            title: "Payment Status Updated",
+            description: `Payment status changed to ${data.job.paymentStatus}`,
+          })
+          fetchJobDetails()
           dispatch(updateJob(data.job))
         }
       })
 
       return unsubscribe
     }
-  }, [job, user, subscribeToJobUpdates, toast, dispatch])
+  }, [job?._id, user, subscribeToJobUpdates, toast, dispatch])
 
   // Listen for real-time messages
   useEffect(() => {
