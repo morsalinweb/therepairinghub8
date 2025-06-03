@@ -6,7 +6,7 @@ import Transaction from "../../../../models/Transaction"
 import Job from "../../../../models/Job"
 import User from "../../../../models/User"
 import Notification from "../../../../models/Notification"
-
+import { emitEvent } from "../../../../lib/websocket-utils"
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET
@@ -107,6 +107,24 @@ async function handleCheckoutSessionCompleted(session) {
 
     console.log("Checkout session completed for transaction:", transaction._id)
 
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "in_escrow",
+    })
+
+    emitEvent("transaction_updated", {
+      userId: transaction.customer.toString(),
+      transactionId: transaction._id.toString(),
+    })
+
     // Schedule job completion after escrow period
     scheduleJobCompletion(job._id, escrowEndDate)
   } catch (error) {
@@ -162,6 +180,24 @@ async function handlePaymentIntentSucceeded(paymentIntent) {
 
     console.log("Payment successful for transaction:", transaction._id)
 
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "in_escrow",
+    })
+
+    emitEvent("transaction_updated", {
+      userId: transaction.customer.toString(),
+      transactionId: transaction._id.toString(),
+    })
+
     // Schedule job completion after escrow period
     scheduleJobCompletion(job._id, escrowEndDate)
   } catch (error) {
@@ -206,6 +242,19 @@ async function handlePaymentIntentFailed(paymentIntent) {
     })
 
     console.log("Payment failed for transaction:", transaction._id)
+
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "failed",
+    })
   } catch (error) {
     console.error("Error handling failed payment:", error)
   }
@@ -266,8 +315,8 @@ async function completeJob(jobId) {
       await User.findByIdAndUpdate(job.hiredProvider, {
         $inc: {
           balance: providerAmount,
-          availableBalance: providerAmount,
           totalEarnings: providerAmount,
+          availableBalance: providerAmount,
         },
       })
 
@@ -289,6 +338,30 @@ async function completeJob(jobId) {
       })
 
       console.log(`Job ${jobId} completed and payment released automatically`)
+
+      // Emit events for real-time updates
+      emitEvent("job_updated", {
+        jobId: job._id.toString(),
+        action: "updated",
+        job: job.toObject(),
+      })
+
+      emitEvent("payment_updated", {
+        transactionId: transaction._id.toString(),
+        jobId: job._id.toString(),
+        status: "released",
+      })
+
+      emitEvent("escrow_released", {
+        providerId: job.hiredProvider.toString(),
+        amount: providerAmount,
+        jobId: job._id.toString(),
+      })
+
+      emitEvent("transaction_updated", {
+        userId: transaction.customer.toString(),
+        transactionId: transaction._id.toString(),
+      })
     }
   } catch (error) {
     console.error("Error completing job:", error)
