@@ -11,6 +11,7 @@ const nextConfig = {
   },
   images: {
     unoptimized: true,
+    domains: ['localhost', 'your-domain.com'],
   },
   webpack: (config, { isServer }) => {
     if (!isServer) {
@@ -45,6 +46,36 @@ const nextConfig = {
             ].join("; "),
           },
         ],
+      },
+      {
+        source: '/api/payments/:path*',
+        headers: [
+          {
+            key: 'Access-Control-Allow-Origin',
+            value: '*',
+          },
+          {
+            key: 'Access-Control-Allow-Methods',
+            value: 'GET, POST, PUT, DELETE, OPTIONS',
+          },
+          {
+            key: 'Access-Control-Allow-Headers',
+            value: 'Content-Type, Authorization, stripe-signature',
+          },
+        ],
+      },
+    ]
+  },
+  // Ensure webhooks work in production
+  async rewrites() {
+    return [
+      {
+        source: '/api/payments/stripe/webhook',
+        destination: '/api/payments/stripe/webhook',
+      },
+      {
+        source: '/api/payments/paypal/webhook',
+        destination: '/api/payments/paypal/webhook',
       },
     ]
   },
