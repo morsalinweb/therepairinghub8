@@ -1,13 +1,12 @@
-// Update the webhook handler to emit events for real-time updates
 import { NextResponse } from "next/server"
 import { headers } from "next/headers"
 import Stripe from "stripe"
-import connectToDatabase from "../../../../lib/db"
-import Transaction from "../../../../models/Transaction"
-import Job from "../../../../models/Job"
-import User from "../../../../models/User"
-import Notification from "../../../../models/Notification"
-import { emitEvent } from "../../../../lib/websocket-utils"
+import connectToDatabase from "../../../../../lib/db"
+import Transaction from "../../../../../models/Transaction"
+import Job from "../../../../../models/Job"
+import User from "../../../../../models/User"
+import Notification from "../../../../../models/Notification"
+import { sendNotification } from "../../../../../lib/socket"
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET
@@ -29,16 +28,18 @@ export async function POST(req) {
       return NextResponse.json({ success: false, message: `Webhook Error: ${err.message}` }, { status: 400 })
     }
 
+    console.log(`🎯 Processing Stripe webhook event: ${event.type}`)
+
     // Handle the event
     switch (event.type) {
-      case "checkout.session.completed":
-        await handleCheckoutSessionCompleted(event.data.object)
-        break
       case "payment_intent.succeeded":
         await handlePaymentIntentSucceeded(event.data.object)
         break
       case "payment_intent.payment_failed":
         await handlePaymentIntentFailed(event.data.object)
+        break
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event.data.object)
         break
       default:
         console.log(`Unhandled event type: ${event.type}`)
@@ -54,23 +55,32 @@ export async function POST(req) {
 // Handle checkout session completed
 async function handleCheckoutSessionCompleted(session) {
   try {
+    console.log(`🔄 Processing checkout session completed: ${session.id}`)
+
     // Find transaction by session ID
-    const transaction = await Transaction.findOne({ paymentId: session.id })
+    const transaction = await Transaction.findOne({ paymentId: session.id }).populate("job")
     if (!transaction) {
-      console.error("Transaction not found for session:", session.id)
+      console.error("❌ Transaction not found for session:", session.id)
       return
     }
+
+    console.log(`📦 Found transaction: ${transaction._id}`)
 
     // Update transaction status
     transaction.status = "in_escrow"
     await transaction.save()
 
-    // Get the job
-    const job = await Job.findById(transaction.job)
+    // Get the job with populated fields
+    const job = await Job.findById(transaction.job._id || transaction.job)
+      .populate("postedBy", "name email")
+      .populate("hiredProvider", "name email")
+
     if (!job) {
-      console.error("Job not found for transaction:", transaction._id)
+      console.error("❌ Job not found for transaction:", transaction._id)
       return
     }
+
+    console.log(`🎯 Processing job: ${job._id}, current status: ${job.status}`)
 
     // Set escrow end date (default 1 minute from now)
     const escrowPeriodMinutes = Number.parseInt(process.env.ESCROW_PERIOD_MINUTES || "1", 10)
@@ -82,6 +92,8 @@ async function handleCheckoutSessionCompleted(session) {
     job.escrowEndDate = escrowEndDate
     job.transactionId = transaction._id
     await job.save()
+
+    console.log(`✅ Job updated - Status: ${job.status}, Payment Status: ${job.paymentStatus}`)
 
     // Update buyer's spending
     await User.findByIdAndUpdate(transaction.customer, {
@@ -97,62 +109,61 @@ async function handleCheckoutSessionCompleted(session) {
       onModel: "Transaction",
     })
 
+    // Send real-time notification
+    sendNotification(transaction.customer, notification)
+
     // Create notification for provider
-    const providerNotification = await Notification.create({
-      recipient: job.hiredProvider,
-      type: "job_assigned",
-      message: `You have been hired for the job: ${job.title}. Payment has been received.`,
-      relatedId: job._id,
-      onModel: "Job",
-    })
+    if (job.hiredProvider) {
+      const providerNotification = await Notification.create({
+        recipient: job.hiredProvider._id,
+        type: "job_assigned",
+        message: `You have been hired for the job: ${job.title}. Payment has been received.`,
+        relatedId: job._id,
+        onModel: "Job",
+      })
 
-    console.log("Checkout session completed for transaction:", transaction._id)
+      // Send real-time notification to provider
+      sendNotification(job.hiredProvider._id, providerNotification)
+    }
 
-    // Emit events for real-time updates
-    emitEvent("job_updated", {
-      jobId: job._id.toString(),
-      action: "updated",
-      job: job.toObject(),
-    })
-
-    emitEvent("payment_updated", {
-      transactionId: transaction._id.toString(),
-      jobId: job._id.toString(),
-      status: "in_escrow",
-    })
-
-    emitEvent("transaction_updated", {
-      userId: transaction.customer.toString(),
-      transactionId: transaction._id.toString(),
-    })
+    console.log("✅ Checkout session completed for transaction:", transaction._id)
 
     // Schedule job completion after escrow period
     scheduleJobCompletion(job._id, escrowEndDate)
   } catch (error) {
-    console.error("Error handling checkout session completed:", error)
+    console.error("❌ Error handling checkout session completed:", error)
   }
 }
 
 // Handle payment intent succeeded
 async function handlePaymentIntentSucceeded(paymentIntent) {
   try {
+    console.log(`🔄 Processing payment intent succeeded: ${paymentIntent.id}`)
+
     // Find transaction
     const transaction = await Transaction.findOne({ paymentId: paymentIntent.id })
     if (!transaction) {
-      console.error("Transaction not found for payment intent:", paymentIntent.id)
+      console.error("❌ Transaction not found for payment intent:", paymentIntent.id)
       return
     }
+
+    console.log(`📦 Found transaction: ${transaction._id}`)
 
     // Update transaction status
     transaction.status = "in_escrow"
     await transaction.save()
 
-    // Get the job
+    // Get the job with populated fields
     const job = await Job.findById(transaction.job)
+      .populate("postedBy", "name email")
+      .populate("hiredProvider", "name email")
+
     if (!job) {
-      console.error("Job not found for transaction:", transaction._id)
+      console.error("❌ Job not found for transaction:", transaction._id)
       return
     }
+
+    console.log(`🎯 Processing job: ${job._id}, current status: ${job.status}`)
 
     // Set escrow end date (default 1 minute from now)
     const escrowPeriodMinutes = Number.parseInt(process.env.ESCROW_PERIOD_MINUTES || "1", 10)
@@ -164,6 +175,8 @@ async function handlePaymentIntentSucceeded(paymentIntent) {
     job.escrowEndDate = escrowEndDate
     job.transactionId = transaction._id
     await job.save()
+
+    console.log(`✅ Job updated - Status: ${job.status}, Payment Status: ${job.paymentStatus}`)
 
     // Update buyer's spending
     await User.findByIdAndUpdate(transaction.customer, {
@@ -179,40 +192,27 @@ async function handlePaymentIntentSucceeded(paymentIntent) {
       onModel: "Transaction",
     })
 
-    console.log("Payment successful for transaction:", transaction._id)
+    // Send real-time notification
+    sendNotification(transaction.customer, notification)
 
-    // Emit events for real-time updates
-    emitEvent("job_updated", {
-      jobId: job._id.toString(),
-      action: "updated",
-      job: job.toObject(),
-    })
-
-    emitEvent("payment_updated", {
-      transactionId: transaction._id.toString(),
-      jobId: job._id.toString(),
-      status: "in_escrow",
-    })
-
-    emitEvent("transaction_updated", {
-      userId: transaction.customer.toString(),
-      transactionId: transaction._id.toString(),
-    })
+    console.log("✅ Payment successful for transaction:", transaction._id)
 
     // Schedule job completion after escrow period
     scheduleJobCompletion(job._id, escrowEndDate)
   } catch (error) {
-    console.error("Error handling successful payment:", error)
+    console.error("❌ Error handling successful payment:", error)
   }
 }
 
 // Handle failed payment
 async function handlePaymentIntentFailed(paymentIntent) {
   try {
+    console.log(`🔄 Processing payment intent failed: ${paymentIntent.id}`)
+
     // Find transaction
     const transaction = await Transaction.findOne({ paymentId: paymentIntent.id })
     if (!transaction) {
-      console.error("Transaction not found for payment intent:", paymentIntent.id)
+      console.error("❌ Transaction not found for payment intent:", paymentIntent.id)
       return
     }
 
@@ -223,7 +223,7 @@ async function handlePaymentIntentFailed(paymentIntent) {
     // Get job
     const job = await Job.findById(transaction.job)
     if (!job) {
-      console.error("Job not found for transaction:", transaction._id)
+      console.error("❌ Job not found for transaction:", transaction._id)
       return
     }
 
@@ -232,6 +232,8 @@ async function handlePaymentIntentFailed(paymentIntent) {
     job.hiredProvider = null
     job.paymentStatus = "pending"
     await job.save()
+
+    console.log(`✅ Job reset - Status: ${job.status}, Payment Status: ${job.paymentStatus}`)
 
     // Create notification for job poster
     const notification = await Notification.create({
@@ -242,22 +244,12 @@ async function handlePaymentIntentFailed(paymentIntent) {
       onModel: "Transaction",
     })
 
-    console.log("Payment failed for transaction:", transaction._id)
+    // Send real-time notification
+    sendNotification(transaction.customer, notification)
 
-    // Emit events for real-time updates
-    emitEvent("job_updated", {
-      jobId: job._id.toString(),
-      action: "updated",
-      job: job.toObject(),
-    })
-
-    emitEvent("payment_updated", {
-      transactionId: transaction._id.toString(),
-      jobId: job._id.toString(),
-      status: "failed",
-    })
+    console.log("✅ Payment failed for transaction:", transaction._id)
   } catch (error) {
-    console.error("Error handling failed payment:", error)
+    console.error("❌ Error handling failed payment:", error)
   }
 }
 
@@ -276,7 +268,7 @@ async function scheduleJobCompletion(jobId, escrowEndDate) {
     await completeJob(jobId)
   }, timeUntilCompletion)
 
-  console.log(`Job ${jobId} scheduled for completion in ${timeUntilCompletion}ms`)
+  console.log(`⏰ Job ${jobId} scheduled for completion in ${timeUntilCompletion}ms`)
 }
 
 // Complete job and release payment
@@ -285,7 +277,7 @@ async function completeJob(jobId) {
     const job = await Job.findById(jobId)
 
     if (!job) {
-      console.error("Job not found for completion:", jobId)
+      console.error("❌ Job not found for completion:", jobId)
       return
     }
 
@@ -294,7 +286,7 @@ async function completeJob(jobId) {
       // Get transaction
       const transaction = await Transaction.findById(job.transactionId)
       if (!transaction) {
-        console.error("Transaction not found for job:", jobId)
+        console.error("❌ Transaction not found for job:", jobId)
         return
       }
 
@@ -338,33 +330,13 @@ async function completeJob(jobId) {
         onModel: "Transaction",
       })
 
-      console.log(`Job ${jobId} completed and payment released automatically`)
+      // Send real-time notifications
+      sendNotification(transaction.customer, buyerNotification)
+      sendNotification(job.hiredProvider, providerNotification)
 
-      // Emit events for real-time updates
-      emitEvent("job_updated", {
-        jobId: job._id.toString(),
-        action: "updated",
-        job: job.toObject(),
-      })
-
-      emitEvent("payment_updated", {
-        transactionId: transaction._id.toString(),
-        jobId: job._id.toString(),
-        status: "released",
-      })
-
-      emitEvent("escrow_released", {
-        providerId: job.hiredProvider.toString(),
-        amount: providerAmount,
-        jobId: job._id.toString(),
-      })
-
-      emitEvent("transaction_updated", {
-        userId: transaction.customer.toString(),
-        transactionId: transaction._id.toString(),
-      })
+      console.log(`✅ Job ${jobId} completed and payment released automatically`)
     }
   } catch (error) {
-    console.error("Error completing job:", error)
+    console.error("❌ Error completing job:", error)
   }
 }
