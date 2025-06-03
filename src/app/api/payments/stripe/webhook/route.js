@@ -1,12 +1,13 @@
-// 
+// Update the webhook handler to emit events for real-time updates
 import { NextResponse } from "next/server"
 import { headers } from "next/headers"
 import Stripe from "stripe"
-import connectToDatabase from "../../../../../lib/db"
-import Transaction from "../../../../../models/Transaction"
-import Job from "../../../../../models/Job"
-import Notification from "../../../../../models/Notification"
-import { sendNotification } from "../../../../../lib/websocket-utils"
+import connectToDatabase from "../../../../lib/db"
+import Transaction from "../../../../models/Transaction"
+import Job from "../../../../models/Job"
+import User from "../../../../models/User"
+import Notification from "../../../../models/Notification"
+import { emitEvent } from "../../../../lib/websocket-utils"
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET
@@ -30,13 +31,14 @@ export async function POST(req) {
 
     // Handle the event
     switch (event.type) {
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event.data.object)
+        break
       case "payment_intent.succeeded":
-        const paymentIntent = event.data.object
-        await handleSuccessfulPayment(paymentIntent)
+        await handlePaymentIntentSucceeded(event.data.object)
         break
       case "payment_intent.payment_failed":
-        const failedPayment = event.data.object
-        await handleFailedPayment(failedPayment)
+        await handlePaymentIntentFailed(event.data.object)
         break
       default:
         console.log(`Unhandled event type: ${event.type}`)
@@ -49,8 +51,90 @@ export async function POST(req) {
   }
 }
 
-// Handle successful payment
-async function handleSuccessfulPayment(paymentIntent) {
+// Handle checkout session completed
+async function handleCheckoutSessionCompleted(session) {
+  try {
+    // Find transaction by session ID
+    const transaction = await Transaction.findOne({ paymentId: session.id })
+    if (!transaction) {
+      console.error("Transaction not found for session:", session.id)
+      return
+    }
+
+    // Update transaction status
+    transaction.status = "in_escrow"
+    await transaction.save()
+
+    // Get the job
+    const job = await Job.findById(transaction.job)
+    if (!job) {
+      console.error("Job not found for transaction:", transaction._id)
+      return
+    }
+
+    // Set escrow end date (default 1 minute from now)
+    const escrowPeriodMinutes = Number.parseInt(process.env.ESCROW_PERIOD_MINUTES || "1", 10)
+    const escrowEndDate = new Date(Date.now() + escrowPeriodMinutes * 60 * 1000)
+
+    // Update job status
+    job.status = "in_progress"
+    job.paymentStatus = "in_escrow"
+    job.escrowEndDate = escrowEndDate
+    job.transactionId = transaction._id
+    await job.save()
+
+    // Update buyer's spending
+    await User.findByIdAndUpdate(transaction.customer, {
+      $inc: { totalSpending: transaction.amount },
+    })
+
+    // Create notification for job poster
+    const notification = await Notification.create({
+      recipient: transaction.customer,
+      type: "payment",
+      message: `Payment successful for job: ${job.title}. Provider has been hired.`,
+      relatedId: transaction._id,
+      onModel: "Transaction",
+    })
+
+    // Create notification for provider
+    const providerNotification = await Notification.create({
+      recipient: job.hiredProvider,
+      type: "job_assigned",
+      message: `You have been hired for the job: ${job.title}. Payment has been received.`,
+      relatedId: job._id,
+      onModel: "Job",
+    })
+
+    console.log("Checkout session completed for transaction:", transaction._id)
+
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "in_escrow",
+    })
+
+    emitEvent("transaction_updated", {
+      userId: transaction.customer.toString(),
+      transactionId: transaction._id.toString(),
+    })
+
+    // Schedule job completion after escrow period
+    scheduleJobCompletion(job._id, escrowEndDate)
+  } catch (error) {
+    console.error("Error handling checkout session completed:", error)
+  }
+}
+
+// Handle payment intent succeeded
+async function handlePaymentIntentSucceeded(paymentIntent) {
   try {
     // Find transaction
     const transaction = await Transaction.findOne({ paymentId: paymentIntent.id })
@@ -63,12 +147,28 @@ async function handleSuccessfulPayment(paymentIntent) {
     transaction.status = "in_escrow"
     await transaction.save()
 
-    // Update job payment status
-    const job = await Job.findByIdAndUpdate(
-      transaction.job,
-      { paymentStatus: "in_escrow", transactionId: transaction._id },
-      { new: true },
-    )
+    // Get the job
+    const job = await Job.findById(transaction.job)
+    if (!job) {
+      console.error("Job not found for transaction:", transaction._id)
+      return
+    }
+
+    // Set escrow end date (default 1 minute from now)
+    const escrowPeriodMinutes = Number.parseInt(process.env.ESCROW_PERIOD_MINUTES || "1", 10)
+    const escrowEndDate = new Date(Date.now() + escrowPeriodMinutes * 60 * 1000)
+
+    // Update job status
+    job.status = "in_progress"
+    job.paymentStatus = "in_escrow"
+    job.escrowEndDate = escrowEndDate
+    job.transactionId = transaction._id
+    await job.save()
+
+    // Update buyer's spending
+    await User.findByIdAndUpdate(transaction.customer, {
+      $inc: { totalSpending: transaction.amount },
+    })
 
     // Create notification for job poster
     const notification = await Notification.create({
@@ -79,17 +179,35 @@ async function handleSuccessfulPayment(paymentIntent) {
       onModel: "Transaction",
     })
 
-    // Send real-time notification
-    sendNotification(transaction.customer, notification)
-
     console.log("Payment successful for transaction:", transaction._id)
+
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "in_escrow",
+    })
+
+    emitEvent("transaction_updated", {
+      userId: transaction.customer.toString(),
+      transactionId: transaction._id.toString(),
+    })
+
+    // Schedule job completion after escrow period
+    scheduleJobCompletion(job._id, escrowEndDate)
   } catch (error) {
     console.error("Error handling successful payment:", error)
   }
 }
 
 // Handle failed payment
-async function handleFailedPayment(paymentIntent) {
+async function handlePaymentIntentFailed(paymentIntent) {
   try {
     // Find transaction
     const transaction = await Transaction.findOne({ paymentId: paymentIntent.id })
@@ -109,6 +227,12 @@ async function handleFailedPayment(paymentIntent) {
       return
     }
 
+    // Reset job status if payment failed
+    job.status = "active"
+    job.hiredProvider = null
+    job.paymentStatus = "pending"
+    await job.save()
+
     // Create notification for job poster
     const notification = await Notification.create({
       recipient: transaction.customer,
@@ -118,11 +242,129 @@ async function handleFailedPayment(paymentIntent) {
       onModel: "Transaction",
     })
 
-    // Send real-time notification
-    sendNotification(transaction.customer, notification)
-
     console.log("Payment failed for transaction:", transaction._id)
+
+    // Emit events for real-time updates
+    emitEvent("job_updated", {
+      jobId: job._id.toString(),
+      action: "updated",
+      job: job.toObject(),
+    })
+
+    emitEvent("payment_updated", {
+      transactionId: transaction._id.toString(),
+      jobId: job._id.toString(),
+      status: "failed",
+    })
   } catch (error) {
     console.error("Error handling failed payment:", error)
+  }
+}
+
+// Schedule job completion after escrow period
+async function scheduleJobCompletion(jobId, escrowEndDate) {
+  const timeUntilCompletion = new Date(escrowEndDate).getTime() - Date.now()
+
+  if (timeUntilCompletion <= 0) {
+    // If escrow period has already passed, complete job immediately
+    await completeJob(jobId)
+    return
+  }
+
+  // Schedule job completion
+  setTimeout(async () => {
+    await completeJob(jobId)
+  }, timeUntilCompletion)
+
+  console.log(`Job ${jobId} scheduled for completion in ${timeUntilCompletion}ms`)
+}
+
+// Complete job and release payment
+async function completeJob(jobId) {
+  try {
+    const job = await Job.findById(jobId)
+
+    if (!job) {
+      console.error("Job not found for completion:", jobId)
+      return
+    }
+
+    // Only complete jobs that are still in escrow
+    if (job.status === "in_progress" && job.paymentStatus === "in_escrow") {
+      // Get transaction
+      const transaction = await Transaction.findById(job.transactionId)
+      if (!transaction) {
+        console.error("Transaction not found for job:", jobId)
+        return
+      }
+
+      // Update transaction
+      transaction.provider = job.hiredProvider
+      transaction.status = "released"
+      await transaction.save()
+
+      // Update job
+      job.status = "completed"
+      job.paymentStatus = "released"
+      job.completedAt = new Date()
+      await job.save()
+
+      // Calculate provider amount (minus service fee)
+      const providerAmount = transaction.amount - (transaction.serviceFee || 0)
+
+      // Update provider's available balance and total earnings
+      await User.findByIdAndUpdate(job.hiredProvider, {
+        $inc: {
+          balance: providerAmount,
+          totalEarnings: providerAmount,
+          availableBalance: providerAmount,
+        },
+      })
+
+      // Create notifications
+      const buyerNotification = await Notification.create({
+        recipient: transaction.customer,
+        type: "job_completed",
+        message: `Your job "${job.title}" has been completed and payment has been released to the provider.`,
+        relatedId: job._id,
+        onModel: "Job",
+      })
+
+      const providerNotification = await Notification.create({
+        recipient: job.hiredProvider,
+        type: "payment",
+        message: `Payment for job "${job.title}" has been released to your account. Your available balance has been updated.`,
+        relatedId: transaction._id,
+        onModel: "Transaction",
+      })
+
+      console.log(`Job ${jobId} completed and payment released automatically`)
+
+      // Emit events for real-time updates
+      emitEvent("job_updated", {
+        jobId: job._id.toString(),
+        action: "updated",
+        job: job.toObject(),
+      })
+
+      emitEvent("payment_updated", {
+        transactionId: transaction._id.toString(),
+        jobId: job._id.toString(),
+        status: "released",
+      })
+
+      emitEvent("escrow_released", {
+        providerId: job.hiredProvider.toString(),
+        amount: providerAmount,
+        jobId: job._id.toString(),
+      })
+
+      emitEvent("transaction_updated", {
+        userId: transaction.customer.toString(),
+        transactionId: transaction._id.toString(),
+      })
+    }
+  } catch (error) {
+    console.error("Error completing job:", error)
   }
 }
