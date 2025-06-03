@@ -1,164 +1,137 @@
-"use client"
+// Update the websocket client to handle more event types
+import { eventEmitter } from "./websocket-utils"
 
-import { useState, useEffect, useCallback } from "react"
-import { useAuth } from "@/contexts/auth-context"
-import { useToast } from "@/hooks/use-toast"
-
-// Create a global event emitter for real-time updates
-class EventEmitter {
-  constructor() {
-    this.events = {}
+// Function to initialize WebSocket connection
+export function initializeWebSocket(token) {
+  if (!token) {
+    console.error("No auth token provided for WebSocket connection")
+    return null
   }
 
-  on(event, listener) {
-    if (!this.events[event]) {
-      this.events[event] = []
-    }
-    this.events[event].push(listener)
-    return () => this.off(event, listener)
+  // Check if we're in a browser environment
+  if (typeof window === "undefined") {
+    return null
   }
 
-  off(event, listener) {
-    if (!this.events[event]) return
-    this.events[event] = this.events[event].filter((l) => l !== listener)
-  }
+  try {
+    // Create WebSocket connection
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+    const wsUrl = `${protocol}//${window.location.host}/ws?token=${token}`
 
-  emit(event, ...args) {
-    if (!this.events[event]) return
-    this.events[event].forEach((listener) => listener(...args))
+    console.log("Initializing WebSocket connection to:", wsUrl)
+
+    const socket = new WebSocket(wsUrl)
+
+    // Connection opened
+    socket.addEventListener("open", (event) => {
+      console.log("WebSocket connection established")
+
+      // Store socket in window for global access
+      window.socket = socket
+
+      // Emit connection event
+      eventEmitter.emit("ws_connected")
+    })
+
+    // Listen for messages
+    socket.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        console.log("WebSocket message received:", data)
+
+        // Handle different event types
+        switch (data.type) {
+          case "job_updated":
+            eventEmitter.emit("job_updated", data.payload)
+            break
+          case "message":
+            eventEmitter.emit("new_message", data.payload)
+            break
+          case "notification":
+            eventEmitter.emit("notification", data.payload)
+            break
+          case "payment_updated":
+            eventEmitter.emit("payment_updated", data.payload)
+            break
+          case "transaction_updated":
+            eventEmitter.emit("transaction_updated", data.payload)
+            break
+          case "escrow_released":
+            eventEmitter.emit("escrow_released", data.payload)
+            break
+          default:
+            console.log("Unknown WebSocket message type:", data.type)
+        }
+      } catch (error) {
+        console.error("Error parsing WebSocket message:", error)
+      }
+    })
+
+    // Connection closed
+    socket.addEventListener("close", (event) => {
+      console.log("WebSocket connection closed:", event.code, event.reason)
+
+      // Remove socket from window
+      delete window.socket
+
+      // Emit disconnection event
+      eventEmitter.emit("ws_disconnected")
+
+      // Attempt to reconnect after delay if closure wasn't intentional
+      if (event.code !== 1000) {
+        console.log("Attempting to reconnect in 5 seconds...")
+        setTimeout(() => {
+          initializeWebSocket(token)
+        }, 5000)
+      }
+    })
+
+    // Connection error
+    socket.addEventListener("error", (error) => {
+      console.error("WebSocket error:", error)
+
+      // Emit error event
+      eventEmitter.emit("ws_error", error)
+    })
+
+    return socket
+  } catch (error) {
+    console.error("Failed to initialize WebSocket:", error)
+    return null
   }
 }
 
-// Create a singleton instance
-export const eventEmitter =
-  typeof window !== "undefined" ? window.eventEmitter || new EventEmitter() : new EventEmitter()
+// Function to send a message through WebSocket
+export function sendWebSocketMessage(type, payload) {
+  if (typeof window === "undefined" || !window.socket) {
+    console.error("WebSocket not initialized")
+    return false
+  }
 
-// Assign to window in browser environment
-if (typeof window !== "undefined") {
-  window.eventEmitter = eventEmitter
+  try {
+    const message = JSON.stringify({
+      type,
+      payload,
+    })
+
+    window.socket.send(message)
+    return true
+  } catch (error) {
+    console.error("Error sending WebSocket message:", error)
+    return false
+  }
 }
 
-// Hook for real-time updates
-export function useRealTimeUpdates() {
-  const { user, isAuthenticated } = useAuth()
-  const { toast } = useToast()
-  const [isPolling, setIsPolling] = useState(false)
-  const [lastMessageTime, setLastMessageTime] = useState(Date.now())
-  const [currentJobId, setCurrentJobId] = useState(null)
-  const [currentRecipientId, setCurrentRecipientId] = useState(null)
+// Function to close WebSocket connection
+export function closeWebSocket() {
+  if (typeof window === "undefined" || !window.socket) {
+    return
+  }
 
-  // Start polling for new messages
-  const startMessagePolling = useCallback(
-    (jobId, recipientId) => {
-      if (!jobId || !recipientId || !isAuthenticated) return
-
-      setCurrentJobId(jobId)
-      setCurrentRecipientId(recipientId)
-      setIsPolling(true)
-    },
-    [isAuthenticated],
-  )
-
-  // Stop polling
-  const stopMessagePolling = useCallback(() => {
-    setIsPolling(false)
-    setCurrentJobId(null)
-    setCurrentRecipientId(null)
-  }, [])
-
-  // Poll for new messages
-  useEffect(() => {
-    if (!isPolling || !currentJobId || !currentRecipientId || !isAuthenticated) return
-
-    const pollInterval = setInterval(async () => {
-      try {
-        const response = await fetch(
-          `/api/messages?job=${currentJobId}&user=${currentRecipientId}&since=${lastMessageTime}`,
-          {
-            credentials: "include",
-          },
-        )
-
-        if (response.ok) {
-          const data = await response.json()
-          if (data.success && data.messages && data.messages.length > 0) {
-            // Update last message time
-            const newestMessage = data.messages.reduce(
-              (newest, msg) =>
-                new Date(msg.createdAt).getTime() > new Date(newest.createdAt).getTime() ? msg : newest,
-              data.messages[0],
-            )
-
-            setLastMessageTime(new Date(newestMessage.createdAt).getTime())
-
-            // Emit event for new messages
-            data.messages.forEach((message) => {
-              eventEmitter.emit("new_message", message)
-            })
-          }
-        }
-      } catch (error) {
-        console.error("Error polling for messages:", error)
-      }
-    }, 3000) // Poll every 3 seconds
-
-    return () => clearInterval(pollInterval)
-  }, [isPolling, currentJobId, currentRecipientId, lastMessageTime, isAuthenticated])
-
-  // Subscribe to job updates
-  const subscribeToJobUpdates = useCallback((jobId, callback) => {
-    if (!jobId) return () => {}
-
-    // Set up event listener
-    const unsubscribe = eventEmitter.on(`job_update_${jobId}`, callback)
-
-    // Start polling for this job
-    setCurrentJobId(jobId)
-
-    return unsubscribe
-  }, [])
-
-  // Send a message
-  const sendMessage = useCallback(
-    async (jobId, receiverId, content) => {
-      if (!jobId || !receiverId || !content || !isAuthenticated) return false
-
-      try {
-        const response = await fetch("/api/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          credentials: "include",
-          body: JSON.stringify({
-            jobId,
-            receiverId,
-            content,
-          }),
-        })
-
-        const data = await response.json()
-
-        if (data.success && data.message) {
-          // Emit event for the new message
-          eventEmitter.emit("new_message", data.message)
-          return true
-        }
-
-        return false
-      } catch (error) {
-        console.error("Error sending message:", error)
-        return false
-      }
-    },
-    [isAuthenticated],
-  )
-
-  return {
-    startMessagePolling,
-    stopMessagePolling,
-    subscribeToJobUpdates,
-    sendMessage,
-    isPolling,
+  try {
+    window.socket.close(1000, "User logged out")
+    delete window.socket
+  } catch (error) {
+    console.error("Error closing WebSocket:", error)
   }
 }
