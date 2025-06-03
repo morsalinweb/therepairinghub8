@@ -27,6 +27,7 @@ export default function FinancialDashboard() {
     earningsTrend: [],
   })
 
+  // Update the useEffect to improve real-time updates
   useEffect(() => {
     fetchFinancialData()
 
@@ -35,8 +36,29 @@ export default function FinancialDashboard() {
       setWithdrawPaypalEmail(user.paypalEmail)
     }
 
-    // Set up polling for real-time updates
-    const interval = setInterval(fetchFinancialData, 30000) // Update every 30 seconds
+    // Set up polling for real-time updates - more frequent polling
+    const interval = setInterval(fetchFinancialData, 10000) // Update every 10 seconds
+
+    // Subscribe to payment events via websocket if available
+    if (window.socket) {
+      console.log("Setting up financial dashboard websocket listeners")
+
+      const handlePaymentUpdate = () => {
+        console.log("Payment update received, refreshing financial data")
+        fetchFinancialData()
+      }
+
+      window.socket.on("payment_updated", handlePaymentUpdate)
+      window.socket.on("transaction_updated", handlePaymentUpdate)
+      window.socket.on("escrow_released", handlePaymentUpdate)
+
+      return () => {
+        clearInterval(interval)
+        window.socket.off("payment_updated", handlePaymentUpdate)
+        window.socket.off("transaction_updated", handlePaymentUpdate)
+        window.socket.off("escrow_released", handlePaymentUpdate)
+      }
+    }
 
     return () => clearInterval(interval)
   }, [user])
