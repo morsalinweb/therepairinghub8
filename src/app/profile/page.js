@@ -9,11 +9,11 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-import { Loader2, Save, UserIcon } from "lucide-react"
+import { Loader2, Save, UserIcon, Star } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { useAuth } from "@/contexts/auth-context"
 import { useTranslation } from "@/lib/i18n"
-import { userAPI } from "@/lib/api"
+import { userAPI, reviewAPI } from "@/lib/api"
 import FinancialDashboard from "@/components/financial-dashboard"
 import DeleteAccountModal from "@/components/delete-account-modal"
 
@@ -26,6 +26,8 @@ export default function ProfilePage() {
   const [avatarPreview, setAvatarPreview] = useState("")
   const [avatarFile, setAvatarFile] = useState(null)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [reviews, setReviews] = useState([])
+  const [reviewsLoading, setReviewsLoading] = useState(false)
 
   const {
     register,
@@ -52,8 +54,32 @@ export default function ProfilePage() {
       if (user.avatar) {
         setAvatarPreview(user.avatar)
       }
+      fetchUserReviews()
     }
   }, [user, loading, reset, router])
+
+  const fetchUserReviews = async () => {
+    if (!user?._id) return
+
+    setReviewsLoading(true)
+    try {
+      const { success, reviews } = await reviewAPI.getReviews({ user: user._id })
+      if (success) {
+        const sortedReviews = reviews.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+        setReviews(sortedReviews)
+      }
+    } catch (error) {
+      console.error("Error fetching reviews:", error)
+    } finally {
+      setReviewsLoading(false)
+    }
+  }
+
+  const renderStars = (rating) => {
+    return Array.from({ length: 5 }, (_, i) => (
+      <Star key={i} className={`h-4 w-4 ${i < rating ? "text-yellow-400 fill-current" : "text-gray-300"}`} />
+    ))
+  }
 
   const handleAvatarChange = (e) => {
     const file = e.target.files[0]
@@ -140,6 +166,7 @@ export default function ProfilePage() {
       <Tabs defaultValue="profile" className="w-full">
         <TabsList className="mb-6">
           <TabsTrigger value="profile">{t("profilePage.profileInformation")}</TabsTrigger>
+          <TabsTrigger value="reviews">{t("profilePage.myReviews")}</TabsTrigger>
           <TabsTrigger value="account">{t("profilePage.accountSettings")}</TabsTrigger>
           <TabsTrigger value="payment">{t("profilePage.paymentSettings")}</TabsTrigger>
           <TabsTrigger value="finance">{t("profilePage.financialDashboard")}</TabsTrigger>
@@ -164,7 +191,9 @@ export default function ProfilePage() {
                       {t("profilePage.profilePicture")}
                     </Label>
                     <Input id="avatar" type="file" accept="image/*" onChange={handleAvatarChange} />
-                    <p className="text-sm text-muted-foreground mt-1">{t("profilePage.profilePictureRecommendation")}</p>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      {t("profilePage.profilePictureRecommendation")}
+                    </p>
                   </div>
                 </div>
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -236,6 +265,78 @@ export default function ProfilePage() {
               </CardFooter>
             </Card>
           </TabsContent>
+          <TabsContent value="reviews">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center justify-between">
+                  <span>
+                    {t("profilePage.myReviews")} ({reviews.length})
+                  </span>
+                  {user?.rating && (
+                    <div className="flex items-center space-x-2">
+                      <div className="flex items-center space-x-1">{renderStars(Math.round(user.rating))}</div>
+                      <span className="text-sm text-muted-foreground">
+                        {user.rating.toFixed(1)} ({user.reviewCount || 0} {t("profilePage.reviews")})
+                      </span>
+                    </div>
+                  )}
+                </CardTitle>
+                <CardDescription>{t("profilePage.reviewsDescription")}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {reviewsLoading ? (
+                  <div className="flex justify-center items-center py-8">
+                    <Loader2 className="h-6 w-6 animate-spin" />
+                  </div>
+                ) : reviews.length === 0 ? (
+                  <div className="text-center py-8">
+                    <p className="text-muted-foreground">{t("profilePage.noReviewsReceived")}</p>
+                    <p className="text-sm text-muted-foreground mt-2">{t("profilePage.reviewsWillAppearHere")}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {reviews.map((review) => (
+                      <div key={review._id} className="border rounded-lg p-4">
+                        <div className="flex items-start justify-between mb-3">
+                          <div className="flex items-center">
+                            <Avatar className="h-10 w-10 mr-3">
+                              <AvatarImage
+                                src={review.reviewer.avatar || "/placeholder.svg?height=40&width=40"}
+                                alt={review.reviewer.name}
+                              />
+                              <AvatarFallback>
+                                {review.reviewer.name
+                                  ? review.reviewer.name
+                                      .split(" ")
+                                      .map((n) => n[0])
+                                      .join("")
+                                  : "U"}
+                              </AvatarFallback>
+                            </Avatar>
+                            <div>
+                              <p className="font-medium">{review.reviewer.name}</p>
+                              <div className="flex items-center">
+                                {renderStars(review.rating)}
+                                <span className="ml-2 text-sm text-muted-foreground">
+                                  {new Date(review.createdAt).toLocaleDateString()}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        <p className="text-foreground">{review.comment}</p>
+                        {review.job && (
+                          <p className="text-xs text-muted-foreground mt-2">
+                            {t("profilePage.reviewForJob")}: {review.job.title}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
           <TabsContent value="account">
             <Card>
               <CardHeader>
@@ -287,9 +388,7 @@ export default function ProfilePage() {
                   <div className="space-y-4">
                     <div>
                       <h3 className="text-lg font-medium text-red-600">{t("profilePage.dangerZone")}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        {t("profilePage.dangerZoneDescription")}
-                      </p>
+                      <p className="text-sm text-muted-foreground">{t("profilePage.dangerZoneDescription")}</p>
                     </div>
                     <Button
                       type="button"
@@ -340,9 +439,7 @@ export default function ProfilePage() {
                     placeholder={t("profilePage.paypalEmailPlaceholder")}
                   />
                   {errors.paypalEmail && <p className="text-sm text-red-500">{errors.paypalEmail.message}</p>}
-                  <p className="text-sm text-muted-foreground mt-1">
-                    {t("profilePage.paypalEmailDescription")}
-                  </p>
+                  <p className="text-sm text-muted-foreground mt-1">{t("profilePage.paypalEmailDescription")}</p>
                 </div>
               </CardContent>
               <CardFooter className="flex justify-end">
